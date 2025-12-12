@@ -196,6 +196,26 @@ clarinet check
 clarinet test
 ```
 
+## Testnet Deployment
+
+All contracts are deployed on Stacks Testnet with Clarity 4 support:
+
+**Deployer Address:** `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM`
+
+| Contract | Address | Explorer |
+|----------|---------|----------|
+| nft-trait | ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft-trait | [View on Explorer](https://explorer.hiro.so/txid/ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft-trait?chain=testnet) |
+| nft-marketplace | ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft-marketplace | [View on Explorer](https://explorer.hiro.so/txid/ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft-marketplace?chain=testnet) |
+| provenance-registry | ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.provenance-registry | [View on Explorer](https://explorer.hiro.so/txid/ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.provenance-registry?chain=testnet) |
+| verified-nft | ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.verified-nft | [View on Explorer](https://explorer.hiro.so/txid/ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.verified-nft?chain=testnet) |
+
+**Deployment Details:**
+- Network: Stacks Testnet
+- Clarity Version: 4
+- Epoch: 3.3
+- Total Deployment Cost: 5.63 STX
+- Transaction Nonces: 5151-5154
+
 ## Example: List and Sell an NFT
 
 ```typescript
