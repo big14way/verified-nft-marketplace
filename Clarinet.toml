@@ -1,0 +1,37 @@
+[project]
+name = "verified-nft-marketplace"
+description = "NFT marketplace with contract verification and provenance certificates"
+authors = ["Builder"]
+telemetry = false
+cache_dir = "./.cache"
+requirements = []
+
+[contracts.nft-trait]
+path = "contracts/nft-trait.clar"
+clarity_version = 4
+epoch = 3.3
+
+[contracts.nft-marketplace]
+path = "contracts/nft-marketplace.clar"
+clarity_version = 4
+epoch = 3.3
+depends_on = ["nft-trait"]
+
+[contracts.provenance-registry]
+path = "contracts/provenance-registry.clar"
+clarity_version = 4
+epoch = 3.3
+
+[contracts.verified-nft]
+path = "contracts/verified-nft.clar"
+clarity_version = 4
+epoch = 3.3
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
