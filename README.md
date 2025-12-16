@@ -263,6 +263,65 @@ console.log(cert);
 
 If collection contract is upgraded (hash changes), verification is invalidated.
 
+## Hiro Chainhooks Integration
+
+This project includes a **Hiro Chainhooks** implementation for real-time monitoring of marketplace activity, user interactions, and fee collection.
+
+### Features
+
+✅ **Real-time Event Tracking**: Monitor NFT listings, sales, offers, and cancellations
+✅ **User Analytics**: Track unique users and their marketplace interactions
+✅ **Fee Monitoring**: Track platform fees (2.5%) and creator royalties
+✅ **Volume Metrics**: Monitor total trading volume and sales count
+✅ **Reorg-Resistant**: Chainhook's built-in protection against blockchain reorganizations
+
+### Tracked Events
+
+| Event | Contract Function | Data Collected |
+|-------|------------------|----------------|
+| NFT Listed | `list-nft` | Seller, token, price, timestamp |
+| NFT Sold | `buy-nft` | Buyer, seller, price, fees |
+| Offer Made | `make-offer` | Offerer, token, amount |
+| Offer Accepted | `accept-offer` | Seller, buyer, price, fees |
+| Listing Cancelled | `cancel-listing` | Seller, token |
+
+### Analytics Output
+
+The Chainhooks observer generates real-time analytics:
+
+```json
+{
+  "uniqueUsers": 42,
+  "totalVolume": 1500000000,
+  "totalSales": 156,
+  "platformFees": 37500000,
+  "royaltyFees": 75000000,
+  "listings": [...],
+  "sales": [...],
+  "timestamp": "2025-01-15T10:30:00.000Z"
+}
+```
+
+### Quick Start
+
+```bash
+cd chainhooks
+npm install
+cp .env.example .env
+# Edit .env with your configuration
+npm start
+```
+
+For detailed setup and configuration, see [chainhooks/README.md](./chainhooks/README.md).
+
+### Use Cases
+
+- **Marketplace Analytics Dashboard**: Real-time metrics for traders and creators
+- **Fee Revenue Tracking**: Monitor platform earnings and royalty distributions
+- **User Engagement Metrics**: Understand marketplace adoption and activity
+- **Compliance Monitoring**: Track all transactions for regulatory reporting
+- **Trading Bots**: React to marketplace events for automated trading
+
 ## License
 
 MIT License
