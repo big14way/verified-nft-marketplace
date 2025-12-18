@@ -15,9 +15,11 @@
 (define-constant ERR_ASSET_PROTECTION_FAILED (err u12007))
 (define-constant ERR_ALREADY_LISTED (err u12008))
 (define-constant ERR_OFFER_NOT_FOUND (err u12009))
+(define-constant ERR_BULK_OPERATION_FAILED (err u12010))
 
 (define-constant LISTING_FIXED_PRICE u0)
 (define-constant LISTING_AUCTION u1)
+(define-constant MAX_BULK_LISTINGS u20)
 
 ;; ========================================
 ;; Data Variables
@@ -271,12 +273,57 @@
           (listing (unwrap! (map-get? listings listing-id) ERR_LISTING_NOT_FOUND)))
         (asserts! (is-eq caller (get seller listing)) ERR_NOT_AUTHORIZED)
         (asserts! (get active listing) ERR_LISTING_NOT_FOUND)
-        
+
         (try! (as-contract (contract-call? nft transfer (get token-id listing) tx-sender caller)))
         (map-set listings listing-id (merge listing { active: false }))
         (map-delete nft-to-listing { nft-contract: (get nft-contract listing), token-id: (get token-id listing) })
         (ok true)
     )
+)
+
+;; ========================================
+;; Bulk Listing Functions
+;; ========================================
+
+;; Helper function for bulk listing - lists a single NFT as part of a batch operation
+;; This can be called multiple times in sequence for bulk listing operations
+(define-public (list-nft-batch-item
+    (nft-contract principal)
+    (token-id uint)
+    (price uint)
+    (duration uint)
+    (nft <nft-trait>))
+    (let ((caller tx-sender) (current-time stacks-block-time) (listing-id (+ (var-get listing-counter) u1)))
+        (begin
+            (asserts! (is-collection-verified nft-contract) ERR_COLLECTION_NOT_VERIFIED)
+            (asserts! (> price u0) ERR_INVALID_PRICE)
+            (asserts! (is-none (map-get? nft-to-listing { nft-contract: nft-contract, token-id: token-id })) ERR_ALREADY_LISTED)
+            (asserts! (is-some (restrict-assets? u1 u0)) ERR_ASSET_PROTECTION_FAILED)
+            (try! (contract-call? nft transfer token-id caller (as-contract tx-sender)))
+            (map-set listings listing-id {
+                nft-contract: nft-contract, token-id: token-id, seller: caller, price: price,
+                listing-type: LISTING_FIXED_PRICE, auction-end: none, highest-bid: u0,
+                highest-bidder: none, created-at: current-time, expires-at: (+ current-time duration), active: true
+            })
+            (map-set nft-to-listing { nft-contract: nft-contract, token-id: token-id } listing-id)
+            (var-set listing-counter listing-id)
+            (ok listing-id)
+        )
+    )
+)
+
+;; Read-only function to get multiple listing details at once
+(define-read-only (get-listings-batch (listing-ids (list 20 uint)))
+    (map get-listing listing-ids)
+)
+
+;; Read-only function to check if multiple NFTs are already listed
+(define-read-only (check-listings-batch (nft-contract principal) (token-ids (list 20 uint)))
+    (map check-single-listing token-ids)
+)
+
+(define-private (check-single-listing (token-id uint))
+    (map-get? nft-to-listing { nft-contract: CONTRACT_OWNER, token-id: token-id })
 )
 
 ;; ========================================
