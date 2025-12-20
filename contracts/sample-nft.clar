@@ -44,22 +44,22 @@
 
 ;; Mint function
 (define-public (mint (recipient principal))
-  (let (
-      (token-id (+ (var-get last-token-id) u1))
+  (let ((token-id (+ (var-get last-token-id) u1)))
+    (begin
+      (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+      (asserts! (<= token-id COLLECTION_LIMIT) ERR_ALREADY_MINTED)
+
+      (try! (nft-mint? sample-nft token-id recipient))
+
+      ;; Set token URI
+      (map-set token-uris
+        { token-id: token-id }
+        { uri: "https://example.com/nft/metadata.json" }
+      )
+
+      (var-set last-token-id token-id)
+      (ok token-id)
     )
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (<= token-id COLLECTION_LIMIT) ERR_ALREADY_MINTED)
-    
-    (try! (nft-mint? sample-nft token-id recipient))
-    
-    ;; Set token URI
-    (map-set token-uris
-      { token-id: token-id }
-      { uri: "https://example.com/nft/metadata.json" }
-    )
-    
-    (var-set last-token-id token-id)
-    (ok token-id)
   )
 )
 
