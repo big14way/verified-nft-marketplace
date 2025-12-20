@@ -19,6 +19,10 @@
 (define-constant ERR_BUNDLE_NOT_FOUND (err u12011))
 (define-constant ERR_INVALID_BUNDLE (err u12012))
 (define-constant ERR_BUNDLE_LIMIT_EXCEEDED (err u12013))
+(define-constant ERR_RENTAL_NOT_FOUND (err u12014))
+(define-constant ERR_RENTAL_ACTIVE (err u12015))
+(define-constant ERR_RENTAL_NOT_EXPIRED (err u12016))
+(define-constant ERR_ALREADY_RENTED (err u12017))
 
 (define-constant LISTING_FIXED_PRICE u0)
 (define-constant LISTING_AUCTION u1)
@@ -102,6 +106,47 @@
         expires-at: uint,
         active: bool
     }
+)
+
+;; ========================================
+;; NFT Rental System Data Structures
+;; ========================================
+
+(define-data-var rental-counter uint u0)
+
+;; Active NFT rentals
+(define-map rentals
+    uint
+    {
+        nft-contract: principal,
+        token-id: uint,
+        owner: principal,
+        renter: principal,
+        rental-price: uint,
+        start-time: uint,
+        end-time: uint,
+        deposit-amount: uint,
+        returned: bool,
+        rental-active: bool
+    }
+)
+
+;; Map NFT to rental ID
+(define-map nft-to-rental
+    { nft-contract: principal, token-id: uint }
+    uint
+)
+
+;; Track rental history per owner
+(define-map owner-rentals
+    principal
+    (list 50 uint)
+)
+
+;; Track rental history per renter
+(define-map renter-rentals
+    principal
+    (list 50 uint)
 )
 
 ;; ========================================
@@ -223,6 +268,61 @@
             (ok { total-individual: total-individual, bundle-price: bundle-price, savings: savings, discount-bps: (get discount-bps bundle) })
         )
         (err ERR_BUNDLE_NOT_FOUND)
+    )
+)
+
+;; ========================================
+;; NFT Rental Read-Only Functions
+;; ========================================
+
+(define-read-only (get-rental (rental-id uint))
+    (map-get? rentals rental-id)
+)
+
+(define-read-only (get-nft-rental (nft-contract principal) (token-id uint))
+    (match (map-get? nft-to-rental { nft-contract: nft-contract, token-id: token-id })
+        rental-id (get-rental rental-id)
+        none
+    )
+)
+
+(define-read-only (is-rental-active (rental-id uint))
+    (match (get-rental rental-id)
+        rental (and
+            (get rental-active rental)
+            (< stacks-block-time (get end-time rental))
+            (not (get returned rental))
+        )
+        false
+    )
+)
+
+(define-read-only (is-rental-expired (rental-id uint))
+    (match (get-rental rental-id)
+        rental (and
+            (>= stacks-block-time (get end-time rental))
+            (not (get returned rental))
+        )
+        false
+    )
+)
+
+(define-read-only (get-owner-rentals (owner principal))
+    (default-to (list) (map-get? owner-rentals owner))
+)
+
+(define-read-only (get-renter-rentals (renter principal))
+    (default-to (list) (map-get? renter-rentals renter))
+)
+
+(define-read-only (calculate-rental-earnings (rental-id uint))
+    (match (get-rental rental-id)
+        rental (ok {
+            rental-price: (get rental-price rental),
+            deposit: (get deposit-amount rental),
+            total-earnings: (+ (get rental-price rental) (get deposit-amount rental))
+        })
+        ERR_RENTAL_NOT_FOUND
     )
 )
 
@@ -584,6 +684,216 @@
             event: "bundle-cancelled",
             bundle-id: bundle-id,
             seller: tx-sender,
+            timestamp: stacks-block-time
+        })
+
+        (ok true)
+    )
+)
+
+;; ========================================
+;; NFT Rental Public Functions
+;; ========================================
+
+;; Create rental listing for NFT
+(define-public (create-rental
+    (nft-contract principal)
+    (token-id uint)
+    (rental-price uint)
+    (duration uint)
+    (deposit-amount uint)
+    (nft <nft-trait>))
+    (let
+        (
+            (rental-id (var-get rental-counter))
+            (current-time stacks-block-time)
+            (nft-principal (contract-of nft))
+            (owner-list (get-owner-rentals tx-sender))
+        )
+        ;; Validations
+        (asserts! (is-eq nft-principal nft-contract) ERR_NOT_AUTHORIZED)
+        (asserts! (is-collection-verified nft-contract) ERR_COLLECTION_NOT_VERIFIED)
+        (asserts! (> rental-price u0) ERR_INVALID_PRICE)
+        (asserts! (> duration u0) ERR_INVALID_PRICE)
+        (asserts! (is-none (map-get? nft-to-rental { nft-contract: nft-contract, token-id: token-id })) ERR_ALREADY_RENTED)
+
+        ;; Transfer NFT to contract for custody
+        (try! (contract-call? nft transfer token-id tx-sender (as-contract tx-sender)))
+
+        ;; Create rental record
+        (map-set rentals
+            rental-id
+            {
+                nft-contract: nft-contract,
+                token-id: token-id,
+                owner: tx-sender,
+                renter: tx-sender, ;; Temporary, will be updated when rented
+                rental-price: rental-price,
+                start-time: current-time,
+                end-time: (+ current-time duration),
+                deposit-amount: deposit-amount,
+                returned: false,
+                rental-active: false  ;; Not active until someone rents it
+            }
+        )
+
+        ;; Map NFT to rental
+        (map-set nft-to-rental { nft-contract: nft-contract, token-id: token-id } rental-id)
+
+        ;; Track owner rentals
+        (map-set owner-rentals
+            tx-sender
+            (unwrap! (as-max-len? (append owner-list rental-id) u50) ERR_BULK_OPERATION_FAILED)
+        )
+
+        ;; Increment counter
+        (var-set rental-counter (+ rental-id u1))
+
+        ;; Emit Chainhook event
+        (print {
+            event: "rental-created",
+            rental-id: rental-id,
+            nft-contract: nft-contract,
+            token-id: token-id,
+            owner: tx-sender,
+            rental-price: rental-price,
+            duration: duration,
+            deposit-amount: deposit-amount,
+            timestamp: current-time
+        })
+
+        (ok rental-id)
+    )
+)
+
+;; Rent an NFT
+(define-public (rent-nft (rental-id uint) (nft <nft-trait>))
+    (let
+        (
+            (rental (unwrap! (get-rental rental-id) ERR_RENTAL_NOT_FOUND))
+            (current-time stacks-block-time)
+            (nft-principal (contract-of nft))
+            (renter-list (get-renter-rentals tx-sender))
+            (total-payment (+ (get rental-price rental) (get deposit-amount rental)))
+        )
+        ;; Validations
+        (asserts! (is-eq nft-principal (get nft-contract rental)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get rental-active rental)) ERR_RENTAL_ACTIVE)
+        (asserts! (not (is-eq tx-sender (get owner rental))) ERR_NOT_AUTHORIZED)
+
+        ;; Transfer payment to owner (rental price + deposit)
+        (try! (stx-transfer? total-payment tx-sender (get owner rental)))
+
+        ;; Transfer NFT to renter
+        (try! (as-contract (contract-call? nft transfer (get token-id rental) tx-sender tx-sender)))
+
+        ;; Update rental record
+        (map-set rentals
+            rental-id
+            (merge rental {
+                renter: tx-sender,
+                start-time: current-time,
+                end-time: (+ current-time (- (get end-time rental) (get start-time rental))),
+                rental-active: true
+            })
+        )
+
+        ;; Track renter rentals
+        (map-set renter-rentals
+            tx-sender
+            (unwrap! (as-max-len? (append renter-list rental-id) u50) ERR_BULK_OPERATION_FAILED)
+        )
+
+        ;; Emit Chainhook event
+        (print {
+            event: "nft-rented",
+            rental-id: rental-id,
+            renter: tx-sender,
+            owner: (get owner rental),
+            rental-price: (get rental-price rental),
+            deposit: (get deposit-amount rental),
+            end-time: (+ current-time (- (get end-time rental) (get start-time rental))),
+            timestamp: current-time
+        })
+
+        (ok true)
+    )
+)
+
+;; Return rented NFT
+(define-public (return-rental (rental-id uint) (nft <nft-trait>))
+    (let
+        (
+            (rental (unwrap! (get-rental rental-id) ERR_RENTAL_NOT_FOUND))
+            (current-time stacks-block-time)
+            (nft-principal (contract-of nft))
+        )
+        ;; Validations
+        (asserts! (is-eq nft-principal (get nft-contract rental)) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq tx-sender (get renter rental)) ERR_NOT_AUTHORIZED)
+        (asserts! (get rental-active rental) ERR_RENTAL_NOT_FOUND)
+        (asserts! (not (get returned rental)) ERR_RENTAL_NOT_FOUND)
+
+        ;; Transfer NFT back to owner
+        (try! (contract-call? nft transfer (get token-id rental) tx-sender (get owner rental)))
+
+        ;; Return deposit to renter if returned on time
+        (if (<= current-time (get end-time rental))
+            (try! (as-contract (stx-transfer? (get deposit-amount rental) tx-sender (get renter rental))))
+            true  ;; Deposit forfeited if late
+        )
+
+        ;; Update rental record
+        (map-set rentals
+            rental-id
+            (merge rental {
+                returned: true,
+                rental-active: false
+            })
+        )
+
+        ;; Remove NFT from rental mapping
+        (map-delete nft-to-rental { nft-contract: (get nft-contract rental), token-id: (get token-id rental) })
+
+        ;; Emit Chainhook event
+        (print {
+            event: "rental-returned",
+            rental-id: rental-id,
+            renter: tx-sender,
+            owner: (get owner rental),
+            returned-on-time: (<= current-time (get end-time rental)),
+            deposit-returned: (<= current-time (get end-time rental)),
+            timestamp: current-time
+        })
+
+        (ok true)
+    )
+)
+
+;; Cancel rental listing (only if not active)
+(define-public (cancel-rental (rental-id uint) (nft <nft-trait>))
+    (let
+        (
+            (rental (unwrap! (get-rental rental-id) ERR_RENTAL_NOT_FOUND))
+            (nft-principal (contract-of nft))
+        )
+        ;; Validations
+        (asserts! (is-eq nft-principal (get nft-contract rental)) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq tx-sender (get owner rental)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get rental-active rental)) ERR_RENTAL_ACTIVE)
+
+        ;; Transfer NFT back to owner
+        (try! (as-contract (contract-call? nft transfer (get token-id rental) tx-sender (get owner rental))))
+
+        ;; Remove rental mapping
+        (map-delete nft-to-rental { nft-contract: (get nft-contract rental), token-id: (get token-id rental) })
+        (map-delete rentals rental-id)
+
+        ;; Emit Chainhook event
+        (print {
+            event: "rental-cancelled",
+            rental-id: rental-id,
+            owner: tx-sender,
             timestamp: stacks-block-time
         })
 
