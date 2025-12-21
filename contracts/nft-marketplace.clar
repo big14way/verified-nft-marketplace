@@ -23,6 +23,10 @@
 (define-constant ERR_RENTAL_ACTIVE (err u12015))
 (define-constant ERR_RENTAL_NOT_EXPIRED (err u12016))
 (define-constant ERR_ALREADY_RENTED (err u12017))
+(define-constant ERR_INVALID_ROYALTY (err u12018))
+(define-constant ERR_ROYALTY_NOT_SET (err u12019))
+(define-constant ERR_ROYALTY_ALREADY_SET (err u12020))
+(define-constant ERR_INSUFFICIENT_AMOUNT (err u12021))
 
 (define-constant LISTING_FIXED_PRICE u0)
 (define-constant LISTING_AUCTION u1)
@@ -147,6 +151,59 @@
 (define-map renter-rentals
     principal
     (list 50 uint)
+)
+
+;; ========================================
+;; Creator Royalty System
+;; ========================================
+
+(define-data-var contract-principal principal tx-sender)
+(define-data-var max-royalty-bps uint u1000) ;; Max 10% royalties
+(define-data-var total-royalties-paid uint u0)
+
+;; Royalty settings per collection
+(define-map collection-royalties
+    { nft-contract: principal }
+    {
+        creator: principal,
+        royalty-bps: uint,  ;; Basis points (100 = 1%)
+        total-earned: uint,
+        set-at: uint,
+        active: bool
+    }
+)
+
+;; Track royalty payments
+(define-map royalty-payments
+    { payment-id: uint }
+    {
+        nft-contract: principal,
+        token-id: uint,
+        sale-price: uint,
+        royalty-amount: uint,
+        creator: principal,
+        paid-at: uint,
+        seller: principal,
+        buyer: principal
+    }
+)
+
+(define-data-var royalty-payment-counter uint u0)
+
+;; Track creator's claimable royalties
+(define-map creator-claimable-royalties
+    { creator: principal, nft-contract: principal }
+    {
+        total-claimable: uint,
+        total-claimed: uint,
+        last-claim-at: uint
+    }
+)
+
+;; Track sale history for royalty compliance
+(define-map nft-sale-history
+    { nft-contract: principal, token-id: uint }
+    (list 20 uint)  ;; List of payment-ids
 )
 
 ;; ========================================
@@ -473,6 +530,58 @@
 
 (define-private (check-single-listing (token-id uint))
     (map-get? nft-to-listing { nft-contract: CONTRACT_OWNER, token-id: token-id })
+)
+
+;; ========================================
+;; Royalty Read-Only Functions
+;; ========================================
+
+;; Get collection royalty settings
+(define-read-only (get-collection-royalty (nft-contract principal))
+    (map-get? collection-royalties { nft-contract: nft-contract })
+)
+
+;; Calculate royalty amount for a sale
+(define-read-only (calculate-royalty (nft-contract principal) (sale-price uint))
+    (match (get-collection-royalty nft-contract)
+        royalty (if (get active royalty)
+            (/ (* sale-price (get royalty-bps royalty)) u10000)
+            u0)
+        u0)
+)
+
+;; Get creator's claimable royalties
+(define-read-only (get-creator-claimable (creator principal) (nft-contract principal))
+    (default-to
+        { total-claimable: u0, total-claimed: u0, last-claim-at: u0 }
+        (map-get? creator-claimable-royalties { creator: creator, nft-contract: nft-contract }))
+)
+
+;; Get royalty payment details
+(define-read-only (get-royalty-payment (payment-id uint))
+    (map-get? royalty-payments { payment-id: payment-id })
+)
+
+;; Get NFT sale history
+(define-read-only (get-nft-sale-history (nft-contract principal) (token-id uint))
+    (default-to (list) (map-get? nft-sale-history { nft-contract: nft-contract, token-id: token-id }))
+)
+
+;; Get total royalties statistics
+(define-read-only (get-royalty-stats (nft-contract principal))
+    (match (get-collection-royalty nft-contract)
+        royalty {
+            creator: (get creator royalty),
+            royalty-bps: (get royalty-bps royalty),
+            total-earned: (get total-earned royalty),
+            active: (get active royalty)
+        }
+        {
+            creator: CONTRACT_OWNER,
+            royalty-bps: u0,
+            total-earned: u0,
+            active: false
+        })
 )
 
 ;; ========================================
@@ -894,6 +1003,257 @@
             event: "rental-cancelled",
             rental-id: rental-id,
             owner: tx-sender,
+            timestamp: stacks-block-time
+        })
+
+        (ok true)
+    )
+)
+
+;; ========================================
+;; Creator Royalty Public Functions
+;; ========================================
+
+;; Set royalty for a collection (creator only)
+(define-public (set-collection-royalty (nft-contract principal) (royalty-bps uint))
+    (let
+        (
+            (current-time stacks-block-time)
+        )
+        ;; Validations
+        (asserts! (is-collection-verified nft-contract) ERR_COLLECTION_NOT_VERIFIED)
+        (asserts! (<= royalty-bps (var-get max-royalty-bps)) ERR_INVALID_ROYALTY)
+        (asserts! (is-none (get-collection-royalty nft-contract)) ERR_ROYALTY_ALREADY_SET)
+
+        ;; Set royalty
+        (map-set collection-royalties
+            { nft-contract: nft-contract }
+            {
+                creator: tx-sender,
+                royalty-bps: royalty-bps,
+                total-earned: u0,
+                set-at: current-time,
+                active: true
+            }
+        )
+
+        ;; Initialize creator claimable tracking
+        (map-set creator-claimable-royalties
+            { creator: tx-sender, nft-contract: nft-contract }
+            {
+                total-claimable: u0,
+                total-claimed: u0,
+                last-claim-at: current-time
+            }
+        )
+
+        ;; Emit Chainhook event
+        (print {
+            event: "royalty-set",
+            nft-contract: nft-contract,
+            creator: tx-sender,
+            royalty-bps: royalty-bps,
+            timestamp: current-time
+        })
+
+        (ok true)
+    )
+)
+
+;; Process royalty payment (called during sales)
+(define-public (process-royalty-payment
+    (nft-contract principal)
+    (token-id uint)
+    (sale-price uint)
+    (seller principal)
+    (buyer principal))
+    (let
+        (
+            (royalty-settings (unwrap! (get-collection-royalty nft-contract) ERR_ROYALTY_NOT_SET))
+            (royalty-amount (calculate-royalty nft-contract sale-price))
+            (payment-id (+ (var-get royalty-payment-counter) u1))
+            (creator (get creator royalty-settings))
+            (current-claimable (get-creator-claimable creator nft-contract))
+            (existing-history (get-nft-sale-history nft-contract token-id))
+            (current-time stacks-block-time)
+        )
+        ;; Validations
+        (asserts! (get active royalty-settings) ERR_ROYALTY_NOT_SET)
+        (asserts! (> royalty-amount u0) ERR_INSUFFICIENT_AMOUNT)
+
+        ;; Record royalty payment
+        (map-set royalty-payments
+            { payment-id: payment-id }
+            {
+                nft-contract: nft-contract,
+                token-id: token-id,
+                sale-price: sale-price,
+                royalty-amount: royalty-amount,
+                creator: creator,
+                paid-at: current-time,
+                seller: seller,
+                buyer: buyer
+            }
+        )
+
+        ;; Update claimable royalties
+        (map-set creator-claimable-royalties
+            { creator: creator, nft-contract: nft-contract }
+            (merge current-claimable {
+                total-claimable: (+ (get total-claimable current-claimable) royalty-amount)
+            })
+        )
+
+        ;; Update collection royalty totals
+        (map-set collection-royalties
+            { nft-contract: nft-contract }
+            (merge royalty-settings {
+                total-earned: (+ (get total-earned royalty-settings) royalty-amount)
+            })
+        )
+
+        ;; Update sale history
+        (match (as-max-len? (append existing-history payment-id) u20)
+            new-history (map-set nft-sale-history
+                { nft-contract: nft-contract, token-id: token-id }
+                new-history)
+            false)
+
+        (var-set royalty-payment-counter payment-id)
+        (var-set total-royalties-paid (+ (var-get total-royalties-paid) royalty-amount))
+
+        ;; Emit Chainhook event
+        (print {
+            event: "royalty-processed",
+            payment-id: payment-id,
+            nft-contract: nft-contract,
+            token-id: token-id,
+            sale-price: sale-price,
+            royalty-amount: royalty-amount,
+            creator: creator,
+            seller: seller,
+            buyer: buyer,
+            timestamp: current-time
+        })
+
+        (ok royalty-amount)
+    )
+)
+
+;; Claim accumulated royalties
+(define-public (claim-royalties (nft-contract principal))
+    (let
+        (
+            (royalty-settings (unwrap! (get-collection-royalty nft-contract) ERR_ROYALTY_NOT_SET))
+            (claimable-info (get-creator-claimable tx-sender nft-contract))
+            (claimable-amount (get total-claimable claimable-info))
+            (current-time stacks-block-time)
+        )
+        ;; Validations
+        (asserts! (is-eq tx-sender (get creator royalty-settings)) ERR_NOT_AUTHORIZED)
+        (asserts! (> claimable-amount u0) ERR_INSUFFICIENT_AMOUNT)
+
+        ;; Transfer royalties to creator
+        (unwrap! (stx-transfer? claimable-amount (var-get contract-principal) tx-sender) ERR_INSUFFICIENT_AMOUNT)
+
+        ;; Update claimable tracking
+        (map-set creator-claimable-royalties
+            { creator: tx-sender, nft-contract: nft-contract }
+            {
+                total-claimable: u0,
+                total-claimed: (+ (get total-claimed claimable-info) claimable-amount),
+                last-claim-at: current-time
+            }
+        )
+
+        ;; Emit Chainhook event
+        (print {
+            event: "royalties-claimed",
+            nft-contract: nft-contract,
+            creator: tx-sender,
+            amount-claimed: claimable-amount,
+            total-claimed: (+ (get total-claimed claimable-info) claimable-amount),
+            timestamp: current-time
+        })
+
+        (ok claimable-amount)
+    )
+)
+
+;; Update royalty settings (creator only)
+(define-public (update-royalty-rate (nft-contract principal) (new-royalty-bps uint))
+    (let
+        (
+            (royalty-settings (unwrap! (get-collection-royalty nft-contract) ERR_ROYALTY_NOT_SET))
+        )
+        ;; Validations
+        (asserts! (is-eq tx-sender (get creator royalty-settings)) ERR_NOT_AUTHORIZED)
+        (asserts! (<= new-royalty-bps (var-get max-royalty-bps)) ERR_INVALID_ROYALTY)
+
+        ;; Update royalty rate
+        (map-set collection-royalties
+            { nft-contract: nft-contract }
+            (merge royalty-settings {
+                royalty-bps: new-royalty-bps
+            })
+        )
+
+        ;; Emit Chainhook event
+        (print {
+            event: "royalty-updated",
+            nft-contract: nft-contract,
+            creator: tx-sender,
+            old-royalty-bps: (get royalty-bps royalty-settings),
+            new-royalty-bps: new-royalty-bps,
+            timestamp: stacks-block-time
+        })
+
+        (ok true)
+    )
+)
+
+;; Toggle royalty collection (creator only)
+(define-public (toggle-royalty (nft-contract principal))
+    (let
+        (
+            (royalty-settings (unwrap! (get-collection-royalty nft-contract) ERR_ROYALTY_NOT_SET))
+            (new-status (not (get active royalty-settings)))
+        )
+        ;; Validations
+        (asserts! (is-eq tx-sender (get creator royalty-settings)) ERR_NOT_AUTHORIZED)
+
+        ;; Toggle active status
+        (map-set collection-royalties
+            { nft-contract: nft-contract }
+            (merge royalty-settings {
+                active: new-status
+            })
+        )
+
+        ;; Emit Chainhook event
+        (print {
+            event: "royalty-toggled",
+            nft-contract: nft-contract,
+            creator: tx-sender,
+            active: new-status,
+            timestamp: stacks-block-time
+        })
+
+        (ok new-status)
+    )
+)
+
+;; Admin: Set maximum royalty rate
+(define-public (set-max-royalty (max-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (<= max-bps u5000) ERR_INVALID_ROYALTY) ;; Max 50%
+
+        (var-set max-royalty-bps max-bps)
+
+        (print {
+            event: "max-royalty-updated",
+            max-royalty-bps: max-bps,
             timestamp: stacks-block-time
         })
 
