@@ -27,6 +27,12 @@
 (define-constant ERR_ROYALTY_NOT_SET (err u12019))
 (define-constant ERR_ROYALTY_ALREADY_SET (err u12020))
 (define-constant ERR_INSUFFICIENT_AMOUNT (err u12021))
+(define-constant ERR_FRACTION_NOT_FOUND (err u12022))
+(define-constant ERR_FRACTION_EXISTS (err u12023))
+(define-constant ERR_INVALID_SHARES (err u12024))
+(define-constant ERR_INSUFFICIENT_SHARES (err u12025))
+(define-constant ERR_FRACTION_LOCKED (err u12026))
+(define-constant ERR_NOT_SHAREHOLDER (err u12027))
 
 (define-constant LISTING_FIXED_PRICE u0)
 (define-constant LISTING_AUCTION u1)
@@ -205,6 +211,66 @@
     { nft-contract: principal, token-id: uint }
     (list 20 uint)  ;; List of payment-ids
 )
+
+;; ========================================
+;; Fractional Ownership System
+;; ========================================
+
+(define-data-var fraction-counter uint u0)
+
+;; Fractionalized NFTs
+(define-map fractional-nfts
+    { nft-contract: principal, token-id: uint }
+    {
+        total-shares: uint,
+        share-price: uint,
+        shares-sold: uint,
+        created-at: uint,
+        creator: principal,
+        active: bool,
+        locked-until: uint,
+        buyout-price: uint,
+        buyout-enabled: bool
+    }
+)
+
+;; Shareholder balances
+(define-map shareholder-balances
+    { nft-contract: principal, token-id: uint, shareholder: principal }
+    {
+        shares: uint,
+        acquired-at: uint,
+        total-spent: uint
+    }
+)
+
+;; Track all shareholders for an NFT
+(define-map nft-shareholders
+    { nft-contract: principal, token-id: uint }
+    (list 100 principal)
+)
+
+;; Dividend distributions
+(define-map dividend-distributions
+    { nft-contract: principal, token-id: uint, distribution-id: uint }
+    {
+        total-amount: uint,
+        per-share-amount: uint,
+        distributed-at: uint,
+        source: (string-ascii 64)
+    }
+)
+
+;; Track claimed dividends
+(define-map dividend-claims
+    { nft-contract: principal, token-id: uint, distribution-id: uint, shareholder: principal }
+    {
+        amount-claimed: uint,
+        claimed-at: uint
+    }
+)
+
+(define-data-var distribution-counter uint u0)
 
 ;; ========================================
 ;; NFT Trait Import
@@ -582,6 +648,46 @@
             total-earned: u0,
             active: false
         })
+)
+
+;; ========================================
+;; Fractional Ownership Read-Only Functions
+;; ========================================
+
+(define-read-only (get-fractional-nft (nft-contract principal) (token-id uint))
+    (map-get? fractional-nfts { nft-contract: nft-contract, token-id: token-id })
+)
+
+(define-read-only (get-shareholder-balance (nft-contract principal) (token-id uint) (shareholder principal))
+    (map-get? shareholder-balances { nft-contract: nft-contract, token-id: token-id, shareholder: shareholder })
+)
+
+(define-read-only (get-nft-shareholders (nft-contract principal) (token-id uint))
+    (default-to (list) (map-get? nft-shareholders { nft-contract: nft-contract, token-id: token-id }))
+)
+
+(define-read-only (get-dividend-distribution (nft-contract principal) (token-id uint) (distribution-id uint))
+    (map-get? dividend-distributions { nft-contract: nft-contract, token-id: token-id, distribution-id: distribution-id })
+)
+
+(define-read-only (get-dividend-claim (nft-contract principal) (token-id uint) (distribution-id uint) (shareholder principal))
+    (map-get? dividend-claims { nft-contract: nft-contract, token-id: token-id, distribution-id: distribution-id, shareholder: shareholder })
+)
+
+(define-read-only (calculate-share-value (nft-contract principal) (token-id uint))
+    (match (get-fractional-nft nft-contract token-id)
+        fraction (if (is-eq (get shares-sold fraction) u0)
+            (get share-price fraction)
+            (/ (* (get buyout-price fraction) u100) (get total-shares fraction)))
+        u0)
+)
+
+(define-read-only (get-shareholder-ownership-percent (nft-contract principal) (token-id uint) (shareholder principal))
+    (match (get-shareholder-balance nft-contract token-id shareholder)
+        balance (match (get-fractional-nft nft-contract token-id)
+            fraction (/ (* (get shares balance) u10000) (get total-shares fraction))
+            u0)
+        u0)
 )
 
 ;; ========================================
@@ -1260,3 +1366,298 @@
         (ok true)
     )
 )
+
+;; ========================================
+;; Fractional Ownership Public Functions
+;; ========================================
+
+;; Fractionalize an NFT into shares
+(define-public (fractionalize-nft (nft-contract <nft-trait>) (token-id uint) (total-shares uint) (share-price uint) (lock-duration uint))
+    (let
+        (
+            (nft-principal (contract-of nft-contract))
+            (fraction-id (+ (var-get fraction-counter) u1))
+            (current-time stacks-block-time)
+            (lock-until (+ current-time lock-duration))
+            (buyout-price (* total-shares share-price))
+        )
+        (asserts! (is-collection-verified nft-principal) ERR_COLLECTION_NOT_VERIFIED)
+        (asserts! (is-none (get-fractional-nft nft-principal token-id)) ERR_FRACTION_EXISTS)
+        (asserts! (> total-shares u1) ERR_INVALID_SHARES)
+        (asserts! (<= total-shares u10000) ERR_INVALID_SHARES)
+        (asserts! (> share-price u0) ERR_INVALID_PRICE)
+        
+        ;; Transfer NFT to contract
+        (try! (contract-call? nft-contract transfer token-id tx-sender (var-get contract-principal)))
+        
+        ;; Create fractional NFT
+        (map-set fractional-nfts
+            { nft-contract: nft-principal, token-id: token-id }
+            {
+                total-shares: total-shares,
+                share-price: share-price,
+                shares-sold: u0,
+                created-at: current-time,
+                creator: tx-sender,
+                active: true,
+                locked-until: lock-until,
+                buyout-price: buyout-price,
+                buyout-enabled: false
+            }
+        )
+        
+        (var-set fraction-counter fraction-id)
+        
+        (print {
+            event: "nft-fractionalized",
+            nft-contract: nft-principal,
+            token-id: token-id,
+            total-shares: total-shares,
+            share-price: share-price,
+            creator: tx-sender,
+            timestamp: current-time
+        })
+        
+        (ok fraction-id)
+    )
+)
+
+;; Purchase shares of fractionalized NFT
+(define-public (purchase-shares (nft-contract principal) (token-id uint) (shares uint))
+    (let
+        (
+            (fraction (unwrap! (get-fractional-nft nft-contract token-id) ERR_FRACTION_NOT_FOUND))
+            (existing-balance (get-shareholder-balance nft-contract token-id tx-sender))
+            (cost (* shares (get share-price fraction)))
+            (new-shares-sold (+ (get shares-sold fraction) shares))
+            (shareholders (get-nft-shareholders nft-contract token-id))
+        )
+        (asserts! (get active fraction) ERR_FRACTION_LOCKED)
+        (asserts! (> shares u0) ERR_INVALID_SHARES)
+        (asserts! (<= new-shares-sold (get total-shares fraction)) ERR_INVALID_SHARES)
+        
+        ;; Transfer payment to creator
+        (try! (stx-transfer? cost tx-sender (get creator fraction)))
+        
+        ;; Update or create shareholder balance
+        (match existing-balance
+            balance (map-set shareholder-balances
+                { nft-contract: nft-contract, token-id: token-id, shareholder: tx-sender }
+                {
+                    shares: (+ (get shares balance) shares),
+                    acquired-at: (get acquired-at balance),
+                    total-spent: (+ (get total-spent balance) cost)
+                })
+            (begin
+                (map-set shareholder-balances
+                    { nft-contract: nft-contract, token-id: token-id, shareholder: tx-sender }
+                    {
+                        shares: shares,
+                        acquired-at: stacks-block-time,
+                        total-spent: cost
+                    })
+                ;; Add to shareholders list
+                (map-set nft-shareholders
+                    { nft-contract: nft-contract, token-id: token-id }
+                    (unwrap! (as-max-len? (append shareholders tx-sender) u100) ERR_INVALID_SHARES))
+            ))
+        
+        ;; Update fraction
+        (map-set fractional-nfts
+            { nft-contract: nft-contract, token-id: token-id }
+            (merge fraction { shares-sold: new-shares-sold })
+        )
+        
+        (print {
+            event: "shares-purchased",
+            nft-contract: nft-contract,
+            token-id: token-id,
+            buyer: tx-sender,
+            shares: shares,
+            cost: cost,
+            timestamp: stacks-block-time
+        })
+        
+        (ok true)
+    )
+)
+
+;; Distribute dividends to shareholders
+(define-public (distribute-dividends (nft-contract principal) (token-id uint) (total-amount uint) (source (string-ascii 64)))
+    (let
+        (
+            (fraction (unwrap! (get-fractional-nft nft-contract token-id) ERR_FRACTION_NOT_FOUND))
+            (distribution-id (var-get distribution-counter))
+            (per-share (/ total-amount (get shares-sold fraction)))
+        )
+        (asserts! (get active fraction) ERR_FRACTION_LOCKED)
+        (asserts! (> total-amount u0) ERR_INVALID_PRICE)
+        (asserts! (> (get shares-sold fraction) u0) ERR_INVALID_SHARES)
+        
+        ;; Transfer total amount to contract
+        (try! (stx-transfer? total-amount tx-sender (var-get contract-principal)))
+        
+        ;; Create distribution record
+        (map-set dividend-distributions
+            { nft-contract: nft-contract, token-id: token-id, distribution-id: distribution-id }
+            {
+                total-amount: total-amount,
+                per-share-amount: per-share,
+                distributed-at: stacks-block-time,
+                source: source
+            }
+        )
+        
+        (var-set distribution-counter (+ distribution-id u1))
+        
+        (print {
+            event: "dividends-distributed",
+            nft-contract: nft-contract,
+            token-id: token-id,
+            distribution-id: distribution-id,
+            total-amount: total-amount,
+            per-share-amount: per-share,
+            timestamp: stacks-block-time
+        })
+        
+        (ok distribution-id)
+    )
+)
+
+;; Claim dividends as shareholder
+(define-public (claim-dividends (nft-contract principal) (token-id uint) (distribution-id uint))
+    (let
+        (
+            (balance (unwrap! (get-shareholder-balance nft-contract token-id tx-sender) ERR_NOT_SHAREHOLDER))
+            (distribution (unwrap! (get-dividend-distribution nft-contract token-id distribution-id) ERR_LISTING_NOT_FOUND))
+            (claim-amount (* (get shares balance) (get per-share-amount distribution)))
+        )
+        (asserts! (is-none (get-dividend-claim nft-contract token-id distribution-id tx-sender)) ERR_ALREADY_LISTED)
+        (asserts! (> claim-amount u0) ERR_INVALID_PRICE)
+        
+        ;; Transfer dividend to shareholder
+        (try! (stx-transfer? claim-amount (var-get contract-principal) tx-sender))
+        
+        ;; Record claim
+        (map-set dividend-claims
+            { nft-contract: nft-contract, token-id: token-id, distribution-id: distribution-id, shareholder: tx-sender }
+            {
+                amount-claimed: claim-amount,
+                claimed-at: stacks-block-time
+            }
+        )
+        
+        (print {
+            event: "dividends-claimed",
+            nft-contract: nft-contract,
+            token-id: token-id,
+            distribution-id: distribution-id,
+            shareholder: tx-sender,
+            amount: claim-amount,
+            timestamp: stacks-block-time
+        })
+        
+        (ok claim-amount)
+    )
+)
+
+;; Enable buyout option for fractionalized NFT
+(define-public (enable-buyout (nft-contract principal) (token-id uint) (buyout-price uint))
+    (let
+        (
+            (fraction (unwrap! (get-fractional-nft nft-contract token-id) ERR_FRACTION_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender (get creator fraction)) ERR_NOT_AUTHORIZED)
+        (asserts! (>= stacks-block-time (get locked-until fraction)) ERR_FRACTION_LOCKED)
+        (asserts! (> buyout-price u0) ERR_INVALID_PRICE)
+        
+        (map-set fractional-nfts
+            { nft-contract: nft-contract, token-id: token-id }
+            (merge fraction {
+                buyout-enabled: true,
+                buyout-price: buyout-price
+            })
+        )
+        
+        (print {
+            event: "buyout-enabled",
+            nft-contract: nft-contract,
+            token-id: token-id,
+            buyout-price: buyout-price,
+            timestamp: stacks-block-time
+        })
+        
+        (ok true)
+    )
+)
+
+;; Buyout entire fractionalized NFT
+(define-public (buyout-fractional-nft (nft-contract <nft-trait>) (token-id uint))
+    (let
+        (
+            (nft-principal (contract-of nft-contract))
+            (fraction (unwrap! (get-fractional-nft nft-principal token-id) ERR_FRACTION_NOT_FOUND))
+        )
+        (asserts! (get buyout-enabled fraction) ERR_FRACTION_LOCKED)
+        (asserts! (get active fraction) ERR_FRACTION_LOCKED)
+        
+        ;; Transfer buyout price to contract for distribution
+        (try! (stx-transfer? (get buyout-price fraction) tx-sender (var-get contract-principal)))
+        
+        ;; Transfer NFT to buyer
+        (try! (contract-call? nft-contract transfer token-id (var-get contract-principal) tx-sender))
+        
+        ;; Deactivate fraction
+        (map-set fractional-nfts
+            { nft-contract: nft-principal, token-id: token-id }
+            (merge fraction { active: false })
+        )
+        
+        (print {
+            event: "fractional-nft-bought-out",
+            nft-contract: nft-principal,
+            token-id: token-id,
+            buyer: tx-sender,
+            buyout-price: (get buyout-price fraction),
+            timestamp: stacks-block-time
+        })
+        
+        (ok true)
+    )
+)
+
+;; Claim buyout proceeds as shareholder
+(define-public (claim-buyout-proceeds (nft-contract principal) (token-id uint))
+    (let
+        (
+            (fraction (unwrap! (get-fractional-nft nft-contract token-id) ERR_FRACTION_NOT_FOUND))
+            (balance (unwrap! (get-shareholder-balance nft-contract token-id tx-sender) ERR_NOT_SHAREHOLDER))
+            (share-value (/ (get buyout-price fraction) (get total-shares fraction)))
+            (payout (* (get shares balance) share-value))
+        )
+        (asserts! (not (get active fraction)) ERR_FRACTION_EXISTS)
+        (asserts! (> (get shares balance) u0) ERR_INSUFFICIENT_SHARES)
+        
+        ;; Transfer payout to shareholder
+        (try! (stx-transfer? payout (var-get contract-principal) tx-sender))
+        
+        ;; Zero out shares
+        (map-set shareholder-balances
+            { nft-contract: nft-contract, token-id: token-id, shareholder: tx-sender }
+            (merge balance { shares: u0 })
+        )
+        
+        (print {
+            event: "buyout-proceeds-claimed",
+            nft-contract: nft-contract,
+            token-id: token-id,
+            shareholder: tx-sender,
+            shares: (get shares balance),
+            payout: payout,
+            timestamp: stacks-block-time
+        })
+        
+        (ok payout)
+    )
+)
+
